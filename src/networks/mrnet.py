@@ -3,7 +3,6 @@ import torch.nn.functional as F
 
 from .blocks import *
 
-
 def conv1x1(in_channel, out_channel, stride=1):
     return nn.Conv2d(in_channel, out_channel, kernel_size=1, stride=stride, bias=False)
 
@@ -23,17 +22,18 @@ class Reshape(nn.Module):
 
 class MRNet(nn.Module):
     def __init__(self, use_meta=False, row_col=True, dropout=False, do_contrast=False, force_bias=False,
-                 relu_before_reduce=False, reduce_func='sum', levels='111', multihead=False):
+                 relu_before_reduce=False, reduce_func='sum', levels='111', multihead=False, big_flag=True):
         super(MRNet, self).__init__()
         self.use_meta = use_meta
         self.do_contrast = do_contrast
         self.relu_before_reduce = relu_before_reduce
         self.levels = levels
+        big = big_flag
         print(f'CONTRAST: {self.do_contrast}')
         print(f'LEVELS: {self.levels}')
 
         if dropout:
-            _dropout = {
+            _dropout = { # prob
                 'high': 0.1,
                 'mid': 0.1,
                 'low': 0.1,
@@ -48,16 +48,18 @@ class MRNet(nn.Module):
             }
         # Perception
         if big:
+            print('===> big <===')
             self.high_dim, self.high_dim0 = 128, 64
             self.mid_dim, self.mid_dim0 = 256, 128
             self.low_dim, self.low_dim0 = 512, 256
         else:
+            print('===> small <===')
             self.high_dim, self.high_dim0 = 64, 32
             self.mid_dim, self.mid_dim0 = 128, 64
             self.low_dim, self.low_dim0 = 256, 128
 
         self.perception_net_high = nn.Sequential(
-            nn.Conv2d(1, self.high_dim0, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.Conv2d(1, self.high_dim0, kernel_size=7, stride=2, padding=3, bias=False), # self.high_dim0 = out_channels
             nn.BatchNorm2d(self.high_dim0),
             nn.ReLU(inplace=True),
             nn.Dropout2d(_dropout['high']),
