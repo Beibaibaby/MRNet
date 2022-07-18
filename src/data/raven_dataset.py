@@ -22,13 +22,14 @@ def to_tensor(sample):
 
 class RAVENDataset(Dataset):
     def __init__(self, root, cache_root, dataset_type=None, image_size=80, transform=None,
-                 use_cache=False, save_cache=False, in_memory=False, subset=None, flip=False, permute=False):
+                 use_cache=False, save_cache=False, in_memory=False, subset=None, flip=False, permute=False,
+                 num_label_raven=None, labeled=True):
         self.root = root
         self.cache_root = cache_root if cache_root is not None else root
         self.dataset_type = dataset_type
         self.image_size = image_size
         self.transform = transform
-        self.use_cache = use_cache
+        self.use_cache = use_cache # defult: False
         self.save_cache = save_cache
         self.flip = flip
         self.permute = permute
@@ -37,10 +38,12 @@ class RAVENDataset(Dataset):
             self.cached_dir = os.path.join(self.cache_root, 'cache', f'{self.dataset_type}_{self.image_size}')
 
         if self.root is not None:
-            self.data_dir = os.path.join(self.root, 'data')
+            # self.data_dir = os.path.join(self.root, 'RAVEN-F')
+            self.data_dir = self.root # path + dataset
         else:
             self.data_dir = self.cached_dir
 
+        # subset: 7 different types of problem
         if subset is not None:
             subsets = [subset]
             assert os.path.isdir(os.path.join(self.data_dir, subset))
@@ -48,14 +51,30 @@ class RAVENDataset(Dataset):
             subsets = os.listdir(self.data_dir)
 
         self.file_names = []
+        # "*_{}.npz".format(self.dataset_type)
+        # decide the set in [train, valid, test]
         for i in subsets:
-            file_names = [os.path.basename(f) for f in glob.glob(os.path.join(self.data_dir, i, "*.npz"))]
+            file_names = [os.path.basename(f) for f in glob.glob(os.path.join(
+                self.data_dir, i, "*_{}.npz".format(self.dataset_type)))]
             file_names.sort()
             self.file_names += [os.path.join(i, f) for f in file_names]
 
         self.memory = None
         if in_memory:
             self.load_memory()
+
+        # labeled data and unlabeled data in training set
+        if self.dataset_type == 'train':
+            print(num_label_raven)
+            if num_label_raven <= 42000 / 2: # labeled data <=50%
+                if labeled:
+                    self.file_names = self.file_names[:num_label_raven]
+                else:
+                    self.file_names = self.file_names[num_label_raven:]
+            else:
+                raise ValueError('wrong error of num_label_raven')
+
+            # unlabel data
 
     def load_memory(self):
         self.memory = [None] * len(self.file_names)
