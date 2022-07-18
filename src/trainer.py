@@ -9,18 +9,30 @@ from tqdm import tqdm
 import criteria
 from report_acc_regime import init_acc_regime, update_acc_regime
 
+### SSL ###
+from semi_sup import losses
+
 torch.backends.cudnn.benchmark = True
+
+ncols_const = 70
 
 
 def renormalize(images):
     return (images / 255 - 0.5) * 2
 
+def update_ema_variables(model, ema_model, alpha, global_step):
+    # Use the true average until the exponential average is more correct
+    alpha = min(1 - 1 / (global_step + 1), alpha)
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
 
 class Trainer:
     def __init__(self, args):
         self.args = args
         self.args.cuda = torch.cuda.is_available()
-        torch.cuda.set_device(self.args.device)
+        # torch.cuda.set_device(self.args.device)
+        if self.args.cuda:
+            torch.cuda.set_device(self.args.device)
         np.random.seed(self.args.seed)
         torch.manual_seed(self.args.seed)
         if self.args.cuda:
@@ -53,7 +65,11 @@ class Trainer:
         self.trainloader = get_data(self.args.path, self.args.dataset, self.args.img_size,
                                     dataset_type="train", regime=self.args.regime, subset=self.args.subset,
                                     batch_size=self.args.batch_size, drop_last=True, num_workers=self.args.num_workers,
-                                    ratio=self.args.ratio, shuffle=True)
+                                    ratio=self.args.ratio, shuffle=True, num_label_raven=self.args.num_label_raven)
+        self.trainloader_unlabel = get_data(self.args.path, self.args.dataset, self.args.img_size,
+                                    dataset_type="train", regime=self.args.regime, subset=self.args.subset,
+                                    batch_size=self.args.batch_size, drop_last=True, num_workers=self.args.num_workers,
+                                    ratio=self.args.ratio, shuffle=True, num_label_raven=self.args.num_label_raven, labeled=False)
         self.validloader = get_data(self.args.path, self.args.dataset, self.args.img_size,
                                     dataset_type="val", regime=self.args.regime, subset=self.args.subset,
                                     batch_size=self.args.batch_size, drop_last=True, num_workers=self.args.num_workers,
@@ -71,12 +87,22 @@ class Trainer:
 
         assert args.model_name == 'mrnet'
         from networks.mrnet import MRNet
-        self.model = MRNet(use_meta=self.use_meta, dropout=args.dropout, force_bias=args.force_bias,
-                           reduce_func=args.r_func, levels=args.levels, do_contrast=args.contrast,
-                           multihead=args.multihead)
+
+        def create_model(ema=False):
+            model = MRNet(use_meta=self.use_meta, dropout=args.dropout, force_bias=args.force_bias,
+                          reduce_func=args.r_func, levels=args.levels, do_contrast=args.contrast,
+                          multihead=args.multihead, big_flag=args.big_flag)
+            if ema:
+                for param in model.parameters():
+                    param.detach_()
+            return model
+
+        self.model=create_model()
+        self.ema_model=create_model(ema=True)
 
         if self.args.cuda:
             self.model.cuda()
+            self.ema_model.cuda()
 
         self.optimizer = optim.Adam([param for param in self.model.parameters() if param.requires_grad],
                                     self.args.lr, betas=(self.args.beta1, self.args.beta2), eps=self.args.epsilon,
@@ -99,34 +125,57 @@ class Trainer:
         if self.use_meta:
             self.criterion_meta = criteria.type_loss
 
+        self.consistency_criterion = losses.softmax_mse_loss
+
     def train(self, epoch):
         self.model.train()
+        self.ema_model.train()
 
-        counter = 0
+        counter = 0 # global_step, and the step here is the iteration
         loss_avg = 0.0
         loss_meta_avg = 0.0
         acc_avg = 0.0
         acc_multihead_avg = [0.0] * 3
 
-        for batch_data in tqdm(self.trainloader, f'Train epoch {epoch}'):
+        trainloader_unlabel_iter = self.trainloader_unlabel.__iter__()
+
+        for batch_data in tqdm(self.trainloader, f'Train epoch {epoch}', ncols=ncols_const):
             counter += 1
 
             image, target, meta_target, structure_encoded, data_file = batch_data
-            image = renormalize(image)
 
-            image = image.cuda()
-            target = target.cuda()
-            if self.use_meta:
-                meta_target = meta_target.cuda()
+            # unlabel data num > label data num
+            image_unlabel, _, _, _, _ = next(trainloader_unlabel_iter)
+
+            ### mean teacher ###
+            image = renormalize(image)
+            image_unlabel = renormalize(image_unlabel)
+
+            if self.args.cuda:
+                image = image.cuda()
+                image_unlabel = image_unlabel.cuda()
+                target = target.cuda()
+
+                if self.use_meta:
+                    meta_target = meta_target.cuda()
 
             model_outputs = self.model(image)
+            stu_model_outputs = self.model(image_unlabel)
+            ema_model_outputs = self.ema_model(image_unlabel)
+
             if len(model_outputs) == 3:
                 model_output, meta_pred, model_output_heads = model_outputs
+                stu_model_output, _, _ = stu_model_outputs
+                ema_model_output, _, _ = ema_model_outputs
             else:
                 model_output, meta_pred = model_outputs
                 model_output_heads = None
 
-            loss = self.criterion(model_output, target)
+            label_loss = self.criterion(model_output, target)
+            unlabel_loss = self.consistency_criterion(stu_model_output, ema_model_output)
+
+            loss = label_loss + self.args.ema_loss_weight * unlabel_loss
+
             loss_avg += loss.item()
             acc = criteria.calculate_acc(model_output, target)
             acc_avg += acc.item()
@@ -165,6 +214,9 @@ class Trainer:
             loss.backward()
             self.optimizer.step()
 
+            # update the teacher model
+            update_ema_variables(self.model, self.ema_model, self.args.ema_decay, counter)
+
         if self.use_meta:
             print("Epoch {}, Train Avg Loss: {:.6f} META: {:.6f}, Train Avg Acc: {:.4f}".format(
                 epoch, loss_avg / float(counter), loss_meta_avg / float(counter), acc_avg / float(counter)))
@@ -185,18 +237,20 @@ class Trainer:
         acc_avg = 0.0
         acc_multihead_avg = [0.0] * 3
 
+        # acc of each different types of problem
         acc_regime = init_acc_regime(self.args.dataset)
 
-        for batch_data in tqdm(self.validloader, f'Valid epoch {epoch}'):
+        for batch_data in tqdm(self.validloader, f'Valid epoch {epoch}', ncols=ncols_const):
             counter += 1
 
             image, target, meta_target, structure_encoded, data_file = batch_data
             image = renormalize(image)
 
-            image = image.cuda()
-            target = target.cuda()
-            if self.use_meta:
-                meta_target = meta_target.cuda()
+            if self.args.cuda:
+                image = image.cuda()
+                target = target.cuda()
+                if self.use_meta:
+                    meta_target = meta_target.cuda()
 
             with torch.no_grad():
                 model_outputs = self.model(image)
@@ -254,16 +308,17 @@ class Trainer:
 
         acc_regime = init_acc_regime(self.args.dataset)
 
-        for batch_data in tqdm(self.testloader, f'Test epoch {epoch}'):
+        for batch_data in tqdm(self.testloader, f'Test epoch {epoch}', ncols=ncols_const):
             counter += 1
 
             image, target, meta_target, structure_encoded, data_file = batch_data
             image = renormalize(image)
 
-            image = image.cuda()
-            target = target.cuda()
-            if self.use_meta:
-                meta_target = meta_target.cuda()
+            if self.args.cuda:
+                image = image.cuda()
+                target = target.cuda()
+                if self.use_meta:
+                    meta_target = meta_target.cuda()
 
             with torch.no_grad():
                 model_outputs = self.model(image)
@@ -420,9 +475,10 @@ class Trainer:
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_val_acc_regime = val_acc_regime
-                best_val_acc_epoch = epoch
+                best_val_acc_epoch = epoch # ???
 
-                # Run test
+                # if val_acc > best_val_acc, then Run test and obtain best_val_test_acc
+                # best_val_test_acc: the corresponding test_acc of best val_acc
                 _, best_val_test_acc, test_acc_regime = self.test(epoch)
 
                 if best_val_test_acc > best_test_acc:
@@ -449,7 +505,9 @@ class Trainer:
                                  'acc_regime': self.val_acc_regime}, f)
 
             if self.args.early_stopping:
-                if epoch - best_val_acc_epoch >= self.args.early_stopping:
+                if epoch - best_val_acc_epoch >= self.args.early_stopping: # early_stopping, default = 20
+                    # > early_stopping, the best_val_acc is still the best
+
                     print(f'Early stopping exit: {epoch - best_val_acc_epoch} > {self.args.early_stopping}')
                     break
                 print(f"Early stopping countdown: {epoch - best_val_acc_epoch}/{self.args.early_stopping} (Best VAL: {best_val_acc:0.5f}, Best VAL TEST: {best_val_test_acc:0.5f}, Best TEST: {best_test_acc:0.5f})")
